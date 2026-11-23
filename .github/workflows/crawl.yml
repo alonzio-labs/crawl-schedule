@@ -1,0 +1,89 @@
+name: Crawl
+
+# Every 6 hours, runs the crawler on alonzio.com in slices of under a minute: registries, then the top domains, testing what
+# it finds. No secret is stored: each call carries a short-lived token GitHub signs for this workflow (OIDC), and Alonzio
+# checks it came from this repository (alonzio-labs/crawl-schedule) or Alonzio's own. Needs the repository variable PUBLIC_URL.
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: crawl
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Refresh the registries and top domains when they are due
+        env:
+          PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+        run: |
+          set -uo pipefail
+          # A large registry is read across calls, carrying on where the last one stopped; up to 20 calls a run.
+          for call in $(seq 1 20); do
+            token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=alonzio-crawl" | jq -r .value)
+            answer=$(curl -sS -X POST --max-time 75 -H "Authorization: Bearer $token" "$PUBLIC_URL/cron/seeds" || true)
+            echo "Seeds $call: ${answer:-no answer in time}"
+            if [ "$(echo "$answer" | jq -r '.done // empty' 2>/dev/null)" = "true" ]; then break; fi
+          done
+      - name: Look for what agents searched for and couldn't use
+        env:
+          PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+        run: |
+          set -uo pipefail
+          for call in $(seq 1 3); do
+            token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=alonzio-crawl" | jq -r .value)
+            answer=$(curl -sS -X POST --max-time 75 -H "Authorization: Bearer $token" "$PUBLIC_URL/cron/wants?step=look" || true)
+            echo "Wants $call: ${answer:-no answer in time}"
+            if [ "$(echo "$answer" | jq -r '.done // empty' 2>/dev/null)" = "true" ]; then break; fi
+          done
+      - name: Re-embed providers made by another model (only after a model switch)
+        env:
+          PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+        run: |
+          set -uo pipefail
+          for call in $(seq 1 40); do
+            token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=alonzio-crawl" | jq -r .value)
+            answer=$(curl -sS -X POST --max-time 75 -H "Authorization: Bearer $token" "$PUBLIC_URL/cron/reembed" || true)
+            echo "Re-embed $call: ${answer:-no answer in time}"
+            left=$(echo "$answer" | jq -r '.staleRemaining // empty' 2>/dev/null || true)
+            if [ "$left" = "0" ]; then break; fi
+            done_now=$(echo "$answer" | jq -r '.reembedded // 0' 2>/dev/null || echo 0)
+            if [ -n "$left" ] && [ "$done_now" = "0" ]; then echo "Re-embedding made no progress; the crawl goes on."; break; fi
+          done
+      - name: Crawl in slices until nothing is due
+        env:
+          PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+        run: |
+          set -uo pipefail
+          # A slow or failed slice is retried with the next one; the run fails only after 3 bad slices in a row.
+          misses=0
+          for slice in $(seq 1 15); do
+            token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=alonzio-crawl" | jq -r .value)
+            answer=$(curl -sS -X POST --max-time 75 -H "Authorization: Bearer $token" "$PUBLIC_URL/cron/crawl" || true)
+            echo "Slice $slice: ${answer:-no answer in time}"
+            remaining=$(echo "$answer" | jq -r '.dueRemaining // empty' 2>/dev/null || true)
+            if [ -z "$remaining" ]; then
+              misses=$((misses + 1))
+              if [ "$misses" -ge 3 ]; then echo "The crawl endpoint failed 3 slices in a row."; exit 1; fi
+              continue
+            fi
+            misses=0
+            if [ "$remaining" = "0" ]; then echo "Nothing left to crawl this run."; break; fi
+          done
+      - name: Search again for each want, as the agent would
+        if: always()
+        env:
+          PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+        run: |
+          set -uo pipefail
+          token=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=alonzio-crawl" | jq -r .value)
+          answer=$(curl -sS -X POST --max-time 75 -H "Authorization: Bearer $token" "$PUBLIC_URL/cron/wants?step=recheck" || true)
+          echo "Recheck: ${answer:-no answer in time}"
